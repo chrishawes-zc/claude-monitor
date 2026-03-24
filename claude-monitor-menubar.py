@@ -71,15 +71,38 @@ def get_conversation_id(cwd):
         return None
 
 
-def get_hook_state(session_id):
-    """Read the state written by the Notification hook. Returns 'idle', 'permission', or None."""
+def get_hook_state(session_id, cwd=None):
+    """Read the state written by the Notification hook. Returns 'idle', 'permission', or None.
+
+    For 'permission' state, verify it's still current by checking that the
+    conversation transcript hasn't been modified since the state was written.
+    If it has, the user already approved and Claude moved on — the state is stale.
+    """
     if not session_id:
         return None
+    state_path = os.path.join(MONITOR_STATE_DIR, session_id)
     try:
-        with open(os.path.join(MONITOR_STATE_DIR, session_id)) as f:
-            return f.read().strip()
-    except FileNotFoundError:
+        with open(state_path) as f:
+            state = f.read().strip()
+    except (FileNotFoundError, OSError):
         return None
+    if state != "permission" or not cwd:
+        return state
+    # Check if the conversation has progressed since the permission was written
+    try:
+        state_mtime = os.path.getmtime(state_path)
+        project_dir = _cwd_to_project_dir(cwd)
+        transcript = os.path.join(
+            os.path.expanduser("~/.claude/projects"),
+            project_dir,
+            session_id + ".jsonl",
+        )
+        transcript_mtime = os.path.getmtime(transcript)
+        if transcript_mtime > state_mtime + 2:
+            return None
+    except OSError:
+        pass
+    return state
 
 
 
@@ -399,7 +422,7 @@ class ClaudeMonitorApp(rumps.App):
             cwd = get_cwd(proc["pid"])
             children = get_working_children(proc["pid"])
             session_id = get_conversation_id(cwd)
-            hook_state = get_hook_state(session_id)
+            hook_state = get_hook_state(session_id, cwd)
             status, detail = infer_status(proc["cpu"], children, hook_state)
             if status in ("READY", "PERMISSION"):
                 ready_count += 1
