@@ -330,18 +330,24 @@ class ClaudeMonitorApp(rumps.App):
         super().__init__("C", quit_button=None)
         self.sessions = []
         self.ready_pids = set()
-        self.inline_mode = self._load_prefs().get("inline_mode", False)
+        prefs = self._load_prefs()
+        self.inline_mode = prefs.get("inline_mode", False)
+        self.sound_enabled = prefs.get("sound_enabled", False)
         self.inline_items = []  # extra NSStatusItem instances
         self._action_handler = _MenuActionHandler.alloc().initWithApp_(self)
 
         self.inline_toggle = rumps.MenuItem(
             "Display Inline", callback=self.toggle_inline
         )
+        self.sound_toggle = rumps.MenuItem(
+            "Sound on Ready", callback=self.toggle_sound
+        )
 
         self.menu = [
             rumps.MenuItem("No active sessions"),
             rumps.separator,
             self.inline_toggle,
+            self.sound_toggle,
             rumps.MenuItem("Refresh Now", callback=self.manual_refresh),
             rumps.MenuItem("Quit", callback=rumps.quit_application),
         ]
@@ -360,6 +366,11 @@ class ClaudeMonitorApp(rumps.App):
         self._save_prefs()
         self.update_display()
 
+    def toggle_sound(self, sender):
+        self.sound_enabled = not self.sound_enabled
+        sender.state = self.sound_enabled
+        self._save_prefs()
+
     @staticmethod
     def _load_prefs():
         try:
@@ -371,6 +382,7 @@ class ClaudeMonitorApp(rumps.App):
     def _save_prefs(self):
         prefs = self._load_prefs()
         prefs["inline_mode"] = self.inline_mode
+        prefs["sound_enabled"] = self.sound_enabled
         with open(PREFS_PATH, "w") as f:
             json.dump(prefs, f)
 
@@ -506,7 +518,7 @@ class ClaudeMonitorApp(rumps.App):
 
         # Play sound if a NEW session became ready
         newly_ready = new_ready_pids - self.ready_pids
-        if newly_ready:
+        if newly_ready and self.sound_enabled:
             self.play_ready_sound()
         self.ready_pids = new_ready_pids
 
@@ -569,6 +581,8 @@ class ClaudeMonitorApp(rumps.App):
 
         self.inline_toggle.state = self.inline_mode
         self.menu.add(self.inline_toggle)
+        self.sound_toggle.state = self.sound_enabled
+        self.menu.add(self.sound_toggle)
         self.menu.add(rumps.MenuItem("Refresh Now", callback=self.manual_refresh))
         self.menu.add(rumps.MenuItem("Quit", callback=rumps.quit_application))
 
