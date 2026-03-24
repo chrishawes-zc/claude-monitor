@@ -1,0 +1,67 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install rumps py2app pyobjc-framework-Cocoa
+
+      - name: Generate icon
+        run: python generate_icon.py
+
+      - name: Build app
+        run: python setup.py py2app
+
+      - name: Sign app
+        run: codesign --force --deep --sign - "dist/Claude Monitor.app"
+
+      - name: Create DMG
+        run: |
+          hdiutil create \
+            -volname "Claude Monitor" \
+            -srcfolder "dist/Claude Monitor.app" \
+            -ov -format UDZO \
+            "Claude-Monitor.dmg"
+
+      - name: Get short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="build-${{ steps.sha.outputs.short }}"
+          gh release create "$tag" \
+            --title "Claude Monitor ($(date +%Y-%m-%d))" \
+            --notes "$(cat <<'EOF'
+          Automated build from commit ${{ github.sha }}.
+
+          ## Install
+          1. Download `Claude-Monitor.dmg` below
+          2. Open the DMG and drag **Claude Monitor** to Applications
+          3. Run the hooks installer (one-time setup):
+             ```
+             curl -sL https://raw.githubusercontent.com/${{ github.repository }}/main/install-hooks.sh | bash
+             ```
+          4. First launch: right-click the app → Open (to bypass Gatekeeper)
+
+          > **Note:** This build is Apple Silicon (arm64) only.
+          EOF
+          )" \
+            --latest \
+            "Claude-Monitor.dmg"
