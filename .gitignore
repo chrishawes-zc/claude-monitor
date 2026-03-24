@@ -1,0 +1,10 @@
+.venv/
+.venv-build/
+build/
+dist/
+*.dmg
+*.egg-info/
+__pycache__/
+*.pyc
+icon.png
+icon.iconset/

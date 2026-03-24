@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""
+Claude Session Monitor - shows active Claude Code sessions and their status.
+Run in a separate terminal window to keep track of all your sessions.
+
+Usage: claude-monitor [--interval SECONDS]
+"""
+
+import curses
+import subprocess
+import time
+import argparse
+import os
+import re
+
+
+def get_claude_processes():
+    """Find all running claude processes."""
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid,tty,%cpu,etime,command"],
+            capture_output=True, text=True, timeout=5
+        )
+        processes = []
+        for line in result.stdout.strip().split("\n")[1:]:  # skip header
+            parts = line.split()
+            if len(parts) >= 5 and parts[4] == "claude":
+                pid = int(parts[0])
+                tty = parts[1]
+                cpu = float(parts[2])
+                elapsed = parts[3]
+                processes.append({
+                    "pid": pid,
+                    "tty": tty,
+                    "cpu": cpu,
+                    "elapsed": elapsed,
+                })
+        return processes
+    except Exception:
+        return []
+
+
+def get_cwd(pid):
+    """Get working directory for a process."""
+    try:
+        result = subprocess.run(
+            ["lsof", "-p", str(pid), "-Fn"],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.split("\n"):
+            if line.startswith("n/") and "cwd" not in line:
+                continue
+            if line.startswith("n/"):
+                return line[1:]
+        # Fallback: look for cwd in lsof output differently
+        lines = result.stdout.split("\n")
+        for i, line in enumerate(lines):
+            if line == "fcwd":
+                if i + 1 < len(lines) and lines[i + 1].startswith("n"):
+                    return lines[i + 1][1:]
+    except Exception:
+        pass
+    return "unknown"
+
+
+def get_working_children(pid):
+    """Count child processes that indicate actual work (ignoring background helpers)."""
+    IGNORED_COMMANDS = {"caffeinate"}
+    try:
+        result = subprocess.run(
+            ["pgrep", "-P", str(pid)],
+            capture_output=True, text=True, timeout=5
+        )
+        child_pids = [l for l in result.stdout.strip().split("\n") if l]
+        working = 0
+        for cpid in child_pids:
+            try:
+                info = subprocess.run(
+                    ["ps", "-p", cpid, "-o", "comm="],
+                    capture_output=True, text=True, timeout=5
+                )
+                cmd = info.stdout.strip().split("/")[-1]
+                if cmd not in IGNORED_COMMANDS:
+                    working += 1
+            except Exception:
+                working += 1
+        return working
+    except Exception:
+        return 0
+
+
+def get_cpu_samples(pid, samples=3, interval=0.3):
+    """Get multiple CPU samples for more accurate reading."""
+    readings = []
+    for _ in range(samples):
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "%cpu="],
+                capture_output=True, text=True, timeout=5
+            )
+            val = result.stdout.strip()
+            if val:
+                readings.append(float(val))
+        except Exception:
+            pass
+        if _ < samples - 1:
+            time.sleep(interval)
+    return sum(readings) / len(readings) if readings else 0.0
+
+
+def shorten_path(path):
+    """Shorten a path for display, keeping project-relevant parts."""
+    # For worktree paths, extract the meaningful part
+    match = re.search(r"worktrees/(.+)$", path)
+    if match:
+        return f"worktree: {match.group(1)}"
+
+    # For regular zerocater paths
+    home = os.path.expanduser("~")
+    if path.startswith(home):
+        path = "~" + path[len(home):]
+
+    # Further shorten common prefixes
+    path = path.replace("~/zerocater/zerocater", "~/z/z")
+    path = path.replace("~/zerocater/", "~/z/")
+    return path
+
+
+def infer_status(cpu, children):
+    """Infer session status from CPU and child process count."""
+    if children > 0:
+        return "WORKING", "running tools"
+    elif cpu > 5.0:
+        return "WORKING", "thinking/generating"
+    else:
+        return "READY", "waiting for you"
+
+
+def draw_monitor(stdscr, interval):
+    """Main curses drawing loop."""
+    curses.curs_set(0)  # hide cursor
+    stdscr.timeout(100)  # non-blocking getch
+
+    # Set up colors
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_GREEN, -1)   # READY
+    curses.init_pair(2, curses.COLOR_YELLOW, -1)   # WORKING
+    curses.init_pair(3, curses.COLOR_CYAN, -1)     # header
+    curses.init_pair(4, curses.COLOR_WHITE, -1)    # normal
+    curses.init_pair(5, curses.COLOR_RED, -1)      # alert/title
+
+    GREEN = curses.color_pair(1) | curses.A_BOLD
+    YELLOW = curses.color_pair(2) | curses.A_BOLD
+    CYAN = curses.color_pair(3) | curses.A_BOLD
+    WHITE = curses.color_pair(4)
+    RED = curses.color_pair(5) | curses.A_BOLD
+
+    last_refresh = 0
+    sessions = []
+    ready_count = 0
+
+    while True:
+        now = time.time()
+
+        # Refresh data on interval
+        if now - last_refresh >= interval:
+            last_refresh = now
+            processes = get_claude_processes()
+            sessions = []
+            ready_count = 0
+
+            for proc in processes:
+                cwd = get_cwd(proc["pid"])
+                children = get_working_children(proc["pid"])
+                # Use the ps-reported CPU (already averaged by OS)
+                status, detail = infer_status(proc["cpu"], children)
+                if status == "READY":
+                    ready_count += 1
+                sessions.append({
+                    **proc,
+                    "cwd": cwd,
+                    "children": children,
+                    "status": status,
+                    "detail": detail,
+                    "project": shorten_path(cwd),
+                })
+
+        stdscr.erase()
+        max_y, max_x = stdscr.getmaxyx()
+        row = 0
+
+        # Title bar
+        title = " Claude Session Monitor "
+        pad = "=" * ((max_x - len(title)) // 2)
+        stdscr.addnstr(row, 0, f"{pad}{title}{pad}", max_x - 1, CYAN)
+        row += 1
+
+        # Summary line
+        total = len(sessions)
+        summary = f" {total} session{'s' if total != 1 else ''} active"
+        if ready_count > 0:
+            summary += f"  |  {ready_count} READY for you!"
+            stdscr.addnstr(row, 0, summary, max_x - 1, GREEN)
+        else:
+            summary += f"  |  all working..."
+            stdscr.addnstr(row, 0, summary, max_x - 1, YELLOW)
+        row += 1
+
+        # Refresh info
+        next_refresh = max(0, interval - (now - last_refresh))
+        stdscr.addnstr(row, 0, f" Refreshing in {next_refresh:.0f}s  |  q to quit", max_x - 1, WHITE)
+        row += 1
+
+        # Separator
+        stdscr.addnstr(row, 0, "─" * (max_x - 1), max_x - 1, WHITE)
+        row += 1
+
+        if not sessions:
+            stdscr.addnstr(row, 0, " No active Claude sessions found.", max_x - 1, WHITE)
+            row += 1
+        else:
+            for i, sess in enumerate(sessions):
+                if row >= max_y - 2:
+                    break
+
+                # Session header with status badge
+                status_color = GREEN if sess["status"] == "READY" else YELLOW
+                badge = f" [{sess['status']}] "
+                indicator = ">>>" if sess["status"] == "READY" else "   "
+
+                stdscr.addnstr(row, 0, f" {indicator} ", max_x - 1, status_color)
+                stdscr.addnstr(row, 6, f"Session {i+1}", max_x - 7, curses.A_BOLD | WHITE)
+                stdscr.addnstr(row, 17, badge, max_x - 18, status_color)
+                detail_start = 17 + len(badge)
+                stdscr.addnstr(row, detail_start, sess["detail"], max_x - detail_start - 1, WHITE)
+                row += 1
+
+                if row >= max_y - 2:
+                    break
+
+                # Project path
+                stdscr.addnstr(row, 0, f"       Project:  {sess['project']}", max_x - 1, WHITE)
+                row += 1
+
+                if row >= max_y - 2:
+                    break
+
+                # Details line
+                details = f"       PID: {sess['pid']}  |  TTY: {sess['tty']}  |  CPU: {sess['cpu']:.1f}%  |  Uptime: {sess['elapsed']}"
+                stdscr.addnstr(row, 0, details, max_x - 1, WHITE)
+                row += 1
+
+                if row < max_y - 2:
+                    stdscr.addnstr(row, 0, "", max_x - 1, WHITE)
+                    row += 1
+
+        # Footer
+        footer_row = max_y - 1
+        footer = " Press 'q' to quit | Refreshes every {}s ".format(interval)
+        stdscr.addnstr(footer_row, 0, footer, max_x - 1, CYAN)
+
+        stdscr.refresh()
+
+        # Check for quit
+        key = stdscr.getch()
+        if key == ord("q") or key == ord("Q"):
+            break
+        elif key == ord("r") or key == ord("R"):
+            last_refresh = 0  # force refresh
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Monitor active Claude Code sessions")
+    parser.add_argument("--interval", "-i", type=int, default=5, help="Refresh interval in seconds (default: 5)")
+    args = parser.parse_args()
+
+    curses.wrapper(draw_monitor, args.interval)
+
+
+if __name__ == "__main__":
+    main()
