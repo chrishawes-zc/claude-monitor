@@ -20,11 +20,17 @@ codesign --force --deep --sign - "dist/Claude Monitor.app"
 
 echo "==> Creating DMG..."
 rm -f "Claude Monitor.dmg"
+DMG_STAGING="dist/dmg-staging"
+rm -rf "$DMG_STAGING"
+mkdir -p "$DMG_STAGING"
+cp -R "dist/Claude Monitor.app" "$DMG_STAGING/"
+ln -s /Applications "$DMG_STAGING/Applications"
 hdiutil create \
     -volname "Claude Monitor" \
-    -srcfolder "dist/Claude Monitor.app" \
+    -srcfolder "$DMG_STAGING" \
     -ov -format UDZO \
     "Claude Monitor.dmg"
+rm -rf "$DMG_STAGING"
 
 echo ""
 echo "Done! Outputs:"

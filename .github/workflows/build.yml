@@ -31,9 +31,12 @@ jobs:
 
       - name: Create DMG
         run: |
+          mkdir -p dist/dmg-staging
+          cp -R "dist/Claude Monitor.app" dist/dmg-staging/
+          ln -s /Applications dist/dmg-staging/Applications
           hdiutil create \
             -volname "Claude Monitor" \
-            -srcfolder "dist/Claude Monitor.app" \
+            -srcfolder dist/dmg-staging \
             -ov -format UDZO \
             "Claude-Monitor.dmg"
 

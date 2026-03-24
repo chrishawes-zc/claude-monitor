@@ -38,13 +38,36 @@ from Foundation import NSSize
 MONITOR_STATE_DIR = os.path.expanduser("~/.claude/monitor-state")
 
 
-def get_session_id(pid):
-    """Read the session ID for a PID from ~/.claude/sessions/<pid>.json."""
+def _cwd_to_project_dir(cwd):
+    """Convert a cwd path to the Claude projects directory name."""
+    # Claude replaces both / and . with - in the directory name
+    return "-" + cwd.lstrip("/").replace("/", "-").replace(".", "-")
+
+
+def get_conversation_id(cwd):
+    """Find the active conversation ID for a session by its cwd.
+
+    The hooks write state files keyed by conversation ID (the ID from the
+    projects directory), not the process-level sessionId. We find the most
+    recently modified .jsonl in the matching project dir.
+    """
+    projects_dir = os.path.expanduser("~/.claude/projects")
+    project_name = _cwd_to_project_dir(cwd)
+    project_path = os.path.join(projects_dir, project_name)
     try:
-        with open(os.path.expanduser(f"~/.claude/sessions/{pid}.json")) as f:
-            data = json.load(f)
-            return data.get("sessionId") or data.get("session_id")
-    except Exception:
+        jsonl_files = [
+            f for f in os.listdir(project_path)
+            if f.endswith(".jsonl")
+        ]
+        if not jsonl_files:
+            return None
+        # Most recently modified = active conversation
+        newest = max(
+            jsonl_files,
+            key=lambda f: os.path.getmtime(os.path.join(project_path, f)),
+        )
+        return newest.removesuffix(".jsonl")
+    except (FileNotFoundError, OSError):
         return None
 
 
@@ -258,7 +281,7 @@ class ClaudeMonitorApp(rumps.App):
         ]
         self.update_display()
 
-    @rumps.timer(5)
+    @rumps.timer(2)
     def poll(self, _):
         self.update_display()
 
@@ -378,7 +401,7 @@ class ClaudeMonitorApp(rumps.App):
         for proc in processes:
             cwd = get_cwd(proc["pid"])
             children = get_working_children(proc["pid"])
-            session_id = get_session_id(proc["pid"])
+            session_id = get_conversation_id(cwd)
             hook_state = get_hook_state(session_id)
             status, detail = infer_status(proc["cpu"], children, hook_state)
             if status == "WORKING":
