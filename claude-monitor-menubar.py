@@ -82,15 +82,6 @@ def get_hook_state(session_id):
         return None
 
 
-def clear_hook_state(session_id):
-    """Remove the state file when a session is detected as working."""
-    if not session_id:
-        return
-    try:
-        os.remove(os.path.join(MONITOR_STATE_DIR, session_id))
-    except FileNotFoundError:
-        pass
-
 
 def get_claude_processes():
     """Find all running claude processes."""
@@ -179,15 +170,21 @@ def dir_name(path):
 
 
 def infer_status(cpu, children, hook_state=None):
-    """Infer session status from hook state, CPU, and child process count."""
-    if children > 0 or cpu > 5.0:
+    """Infer session status from hook state, CPU, and child process count.
+
+    Strong working signals (children, high CPU) override hook state since
+    there is no "started working" hook — the last hook state can be stale.
+    When the process looks idle, trust the hook state to distinguish
+    between permission-waiting and input-waiting.
+    """
+    is_busy = children > 0 or cpu > 5.0
+    if is_busy:
         return "WORKING", "running tools" if children > 0 else "thinking/generating"
-    # If no signs of work, trust the hook state if available
+    # Process looks idle — use hook state to distinguish permission vs ready
     if hook_state == "permission":
         return "PERMISSION", "needs approval"
-    elif hook_state == "idle":
+    if hook_state == "idle":
         return "READY", "waiting for you"
-    # No hook state yet — fall back to heuristic
     return "READY", "waiting for you"
 
 
@@ -404,8 +401,6 @@ class ClaudeMonitorApp(rumps.App):
             session_id = get_conversation_id(cwd)
             hook_state = get_hook_state(session_id)
             status, detail = infer_status(proc["cpu"], children, hook_state)
-            if status == "WORKING":
-                clear_hook_state(session_id)
             if status in ("READY", "PERMISSION"):
                 ready_count += 1
                 new_ready_pids.add(proc["pid"])
