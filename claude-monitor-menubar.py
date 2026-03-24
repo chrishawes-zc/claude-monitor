@@ -106,6 +106,45 @@ def get_hook_state(session_id, cwd=None):
 
 
 
+def get_terminal_app(pid):
+    """Walk up the process tree to find the terminal application for a claude process."""
+    try:
+        current = pid
+        for _ in range(5):  # walk up at most 5 levels
+            result = subprocess.run(
+                ["ps", "-p", str(current), "-o", "ppid=,comm="],
+                capture_output=True, text=True, timeout=5,
+            )
+            parts = result.stdout.strip().split(None, 1)
+            if len(parts) < 2:
+                break
+            ppid, comm = int(parts[0]), parts[1]
+            # Check if this is a known terminal/IDE app
+            if ".app/" in comm:
+                # Extract the .app name from the path
+                match = re.search(r"(/[^/]+\.app)/", comm)
+                if match:
+                    return match.group(0).rstrip("/")
+            current = ppid
+    except Exception:
+        pass
+    return None
+
+
+def activate_terminal(app_path):
+    """Bring a terminal application to the foreground."""
+    # Extract app name from path like /Applications/Warp.app or ~/Applications/PyCharm.app
+    app_name = os.path.basename(app_path).removesuffix(".app")
+    try:
+        subprocess.Popen(
+            ["osascript", "-e", f'tell application "{app_name}" to activate'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
 def get_claude_processes():
     """Find all running claude processes."""
     try:
@@ -266,10 +305,12 @@ class _MenuActionHandler(_NSObject):
         if self is None:
             return None
         self.app = app
+        self.terminal_map = {}  # tag -> terminal_app path
         return self
 
     def toggleInline_(self, sender):
         self.app.inline_mode = not self.app.inline_mode
+        self.app._save_prefs()
         self.app.update_display()
 
     def refresh_(self, sender):
@@ -277,6 +318,11 @@ class _MenuActionHandler(_NSObject):
 
     def quit_(self, sender):
         rumps.quit_application()
+
+    def focusSession_(self, sender):
+        terminal_app = self.terminal_map.get(sender.tag())
+        if terminal_app:
+            activate_terminal(terminal_app)
 
 
 class ClaudeMonitorApp(rumps.App):
@@ -357,11 +403,21 @@ class ClaudeMonitorApp(rumps.App):
                 "PERMISSION": "\U0001F7E6",
                 "WORKING": "\U0001F7E7",
             }
-            for sess in sessions:
+            handler = self._action_handler
+            for i, sess in enumerate(sessions):
                 icon = NS_STATUS_ICONS.get(sess["status"], "\U0001F7E7")
                 label = f"{icon} {sess['project']}  —  {sess['detail']}"
-                menu.addItem_(
-                    NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(label, None, ""))
+                terminal_app = sess.get("terminal_app")
+                if terminal_app:
+                    mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                        label, "focusSession:", "")
+                    mi.setTarget_(handler)
+                    mi.setTag_(sess["pid"])
+                    handler.terminal_map[sess["pid"]] = terminal_app
+                else:
+                    mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                        label, None, "")
+                menu.addItem_(mi)
 
         menu.addItem_(NSMenuItem.separatorItem())
 
@@ -393,7 +449,7 @@ class ClaudeMonitorApp(rumps.App):
 
         colors = get_colors()
         status_bar = NSStatusBar.systemStatusBar()
-        ns_menu = self._build_nsmenu(sessions, ready_count)
+        handler = self._action_handler
 
         STATUS_COLORS = {
             "READY": colors["green"],
@@ -409,7 +465,15 @@ class ClaudeMonitorApp(rumps.App):
             item = status_bar.statusItemWithLength_(NSVariableStatusItemLength)
             button = item.button()
             button.setImage_(img)
-            item.setMenu_(ns_menu)
+
+            # Click to focus the terminal window
+            terminal_app = sess.get("terminal_app")
+            if terminal_app:
+                handler.terminal_map[sess["pid"]] = terminal_app
+                button.setTarget_(handler)
+                button.setAction_(objc.selector(handler.focusSession_, signature=b"v@:@"))
+                button.setTag_(sess["pid"])
+
             self.inline_items.append(item)
 
     def update_display(self):
@@ -434,6 +498,7 @@ class ClaudeMonitorApp(rumps.App):
                 "status": status,
                 "detail": detail,
                 "project": shorten_path(cwd),
+                "terminal_app": get_terminal_app(proc["pid"]),
             })
 
         self.sessions = sessions
@@ -448,10 +513,10 @@ class ClaudeMonitorApp(rumps.App):
         # Update inline status bar items
         self.update_inline_items(sessions, ready_count)
 
-        # Update main menu bar title (hidden when inline mode is active)
-        if self.inline_mode and sessions:
-            self.title = ""
-            self._hide_main_icon()
+        # Update main menu bar title
+        if self.inline_mode:
+            self.title = "C"
+            self._show_main_icon()
         elif total == 0:
             self.title = "C"
             self._show_main_icon()
@@ -487,9 +552,11 @@ class ClaudeMonitorApp(rumps.App):
                 "WORKING": "\U0001F7E7",     # orange square
             }
             for i, sess in enumerate(sessions):
-                icon = STATUS_ICONS.get(sess["status"], "\u23F3")
+                icon = STATUS_ICONS.get(sess["status"], "\U0001F7E7")
                 label = f"{icon} {sess['project']}  —  {sess['detail']}"
-                item = rumps.MenuItem(label)
+                terminal_app = sess.get("terminal_app")
+                callback = (lambda app: lambda _: activate_terminal(app))(terminal_app) if terminal_app else None
+                item = rumps.MenuItem(label, callback=callback)
 
                 item.add(rumps.MenuItem(f"PID: {sess['pid']}"))
                 item.add(rumps.MenuItem(f"TTY: {sess['tty']}"))
