@@ -131,18 +131,59 @@ def get_terminal_app(pid):
     return None
 
 
-def activate_terminal(app_path):
-    """Bring a terminal application to the foreground."""
-    # Extract app name from path like /Applications/Warp.app or ~/Applications/PyCharm.app
+def activate_terminal(app_path, cwd=None, tty=None):
+    """Bring a terminal application to the foreground and focus the correct tab."""
     app_name = os.path.basename(app_path).removesuffix(".app")
+    script = _build_focus_script(app_name, cwd, tty)
     try:
         subprocess.Popen(
-            ["osascript", "-e", f'tell application "{app_name}" to activate'],
+            ["osascript", "-e", script],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
     except Exception:
         pass
+
+
+def _build_focus_script(app_name, cwd, tty):
+    """Build AppleScript to activate the app and focus the tab for the session's project."""
+    # For PyCharm with macOS system tabs, match by project directory name
+    if cwd and app_name.startswith("PyCharm"):
+        project = os.path.basename(cwd)
+        return f'''
+tell application "{app_name}" to activate
+tell application "System Events"
+    tell process "{app_name}"
+        set tabButtons to every radio button of tab group "tab bar" of window 1
+        repeat with btn in tabButtons
+            if name of btn starts with "{project} " then
+                click btn
+                return
+            end if
+        end repeat
+    end tell
+end tell'''
+
+    # For iTerm2, match by TTY device
+    if tty and tty != "??" and app_name == "iTerm2":
+        tty_device = f"/dev/{tty}" if not tty.startswith("/dev/") else tty
+        return f'''
+tell application "iTerm2"
+    activate
+    repeat with w in windows
+        repeat with t in tabs of w
+            repeat with s in sessions of t
+                if tty of s is "{tty_device}" then
+                    select t
+                    select w
+                    return
+                end if
+            end repeat
+        end repeat
+    end repeat
+end tell'''
+
+    return f'tell application "{app_name}" to activate'
 
 
 def get_claude_processes():
@@ -305,7 +346,7 @@ class _MenuActionHandler(_NSObject):
         if self is None:
             return None
         self.app = app
-        self.terminal_map = {}  # tag -> terminal_app path
+        self.terminal_map = {}  # tag -> (terminal_app path, cwd, tty)
         return self
 
     def toggleInline_(self, sender):
@@ -320,9 +361,10 @@ class _MenuActionHandler(_NSObject):
         rumps.quit_application()
 
     def focusSession_(self, sender):
-        terminal_app = self.terminal_map.get(sender.tag())
-        if terminal_app:
-            activate_terminal(terminal_app)
+        entry = self.terminal_map.get(sender.tag())
+        if entry:
+            terminal_app, cwd, tty = entry
+            activate_terminal(terminal_app, cwd, tty)
 
 
 class ClaudeMonitorApp(rumps.App):
@@ -425,7 +467,7 @@ class ClaudeMonitorApp(rumps.App):
                         label, "focusSession:", "")
                     mi.setTarget_(handler)
                     mi.setTag_(sess["pid"])
-                    handler.terminal_map[sess["pid"]] = terminal_app
+                    handler.terminal_map[sess["pid"]] = (terminal_app, sess.get("cwd"), sess.get("tty"))
                 else:
                     mi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                         label, None, "")
@@ -481,7 +523,7 @@ class ClaudeMonitorApp(rumps.App):
             # Click to focus the terminal window
             terminal_app = sess.get("terminal_app")
             if terminal_app:
-                handler.terminal_map[sess["pid"]] = terminal_app
+                handler.terminal_map[sess["pid"]] = (terminal_app, sess.get("cwd"), sess.get("tty"))
                 button.setTarget_(handler)
                 button.setAction_(objc.selector(handler.focusSession_, signature=b"v@:@"))
                 button.setTag_(sess["pid"])
@@ -567,14 +609,10 @@ class ClaudeMonitorApp(rumps.App):
                 icon = STATUS_ICONS.get(sess["status"], "\U0001F7E7")
                 label = f"{icon} {sess['project']}  —  {sess['detail']}"
                 terminal_app = sess.get("terminal_app")
-                callback = (lambda app: lambda _: activate_terminal(app))(terminal_app) if terminal_app else None
+                sess_cwd = sess.get("cwd")
+                sess_tty = sess.get("tty")
+                callback = (lambda app, cwd, tty: lambda _: activate_terminal(app, cwd, tty))(terminal_app, sess_cwd, sess_tty) if terminal_app else None
                 item = rumps.MenuItem(label, callback=callback)
-
-                item.add(rumps.MenuItem(f"PID: {sess['pid']}"))
-                item.add(rumps.MenuItem(f"TTY: {sess['tty']}"))
-                item.add(rumps.MenuItem(f"CPU: {sess['cpu']:.1f}%"))
-                item.add(rumps.MenuItem(f"Uptime: {sess['elapsed']}"))
-
                 self.menu.add(item)
 
         self.menu.add(rumps.separator)
